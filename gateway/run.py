@@ -14302,6 +14302,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if entry:
                     entry.session_id = agent.session_id
                     self.session_store._save()
+                    # Refresh the Telegram DM topic binding so the next
+                    # inbound message resolves to the post-split child
+                    # session instead of the stale pre-compression root.
+                    # Without this, every message re-triggers preflight
+                    # compression in an infinite loop.  (#20470)
+                    try:
+                        self._record_telegram_topic_binding(source, entry)
+                    except Exception:
+                        logger.exception(
+                            "Failed to refresh telegram topic binding after session split"
+                        )
 
                 # If this is a Telegram DM and source.thread_id was lost during
                 # the session split (synthetic / recovered event), restore it
