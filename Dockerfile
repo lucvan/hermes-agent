@@ -146,6 +146,18 @@ RUN set -eu; \
 # updated.
 COPY --chmod=0755 docker/tini-shim.sh /usr/bin/tini
 
+# LibreOffice + poppler-utils for the PowerPoint skill:
+#   - soffice converts .pptx -> PDF
+#   - pdftoppm rasterises PDF pages -> PNG
+# LibreOffice recommends are intentionally kept on: LO needs the Java/font/icon trail to render reliably.
+RUN apt-get update && \
+    apt-get install -y \
+        libreoffice libreoffice-impress libreoffice-writer libreoffice-calc \
+        fonts-dejavu fontconfig && \
+    apt-get install -y --no-install-recommends poppler-utils && \
+    fc-cache -f -v && \
+    rm -rf /var/lib/apt/lists/*
+
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
 
