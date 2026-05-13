@@ -442,4 +442,34 @@ if [ -z "${AGENT_BROWSER_EXECUTABLE_PATH:-}" ] && \
     fi
 fi
 
+# --- .hermes symlink for Hermes Desktop SSH mode ---
+# SSH-proxied calls assume the native layout ($HOME/.hermes/…). In the
+# container the data IS the home dir, so create a self-referential symlink.
+if [ ! -e "$HERMES_HOME/.hermes" ]; then
+    as_hermes ln -s . "$HERMES_HOME/.hermes"
+fi
+
+# --- In-container sshd for Hermes Desktop SSH mode (HERMES_SSHD=1) ---
+case "${HERMES_SSHD:-}" in
+    1|true|TRUE|True|yes|YES|Yes)
+        sshd_port="${HERMES_SSHD_PORT:-2222}"
+        ssh_dir="$HERMES_HOME/.ssh"
+        hostkey_dir="$ssh_dir/sshd_host"
+        mkdir -p "$hostkey_dir"
+        chown -R hermes:hermes "$ssh_dir" 2>/dev/null || true
+        chmod 700 "$ssh_dir" 2>/dev/null || true
+        if [ ! -f "$hostkey_dir/ssh_host_ed25519_key" ]; then
+            ssh-keygen -t ed25519 -f "$hostkey_dir/ssh_host_ed25519_key" -N "" -q
+        fi
+        if [ ! -f "$hostkey_dir/ssh_host_rsa_key" ]; then
+            ssh-keygen -t rsa -b 3072 -f "$hostkey_dir/ssh_host_rsa_key" -N "" -q
+        fi
+        chmod 600 "$hostkey_dir"/ssh_host_*_key 2>/dev/null || true
+        chmod 644 "$hostkey_dir"/ssh_host_*_key.pub 2>/dev/null || true
+        mkdir -p /run/sshd
+        echo "[stage2] Starting in-container sshd on port ${sshd_port}"
+        /usr/sbin/sshd -f /etc/ssh/sshd_config_hermes -p "$sshd_port"
+        ;;
+esac
+
 echo "[stage2] Setup complete; starting user services"

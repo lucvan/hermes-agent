@@ -28,7 +28,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # hermes process, the dashboard, and per-profile gateways.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev procps git openssh-client docker-cli xz-utils && \
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev procps git openssh-client openssh-server docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # ---------- s6-overlay install ----------
@@ -100,10 +100,14 @@ RUN apt-get update && \
     fc-cache -f -v && \
     rm -rf /var/lib/apt/lists/*
 
-# Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
-RUN useradd -u 10000 -m -d /opt/data hermes
+# Non-root user for runtime; UID can be overridden via HERMES_UID at runtime.
+# `-p '*'` sets an unusable-but-not-locked shadow entry so that pubkey SSH
+# auth via the in-container sshd (HERMES_SSHD=1) works — useradd's default
+# `!` is treated as "account locked" by PAM and rejects even pubkey logins.
+RUN useradd -u 10000 -m -d /opt/data -p '*' hermes
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+COPY --chmod=0644 docker/sshd_config_hermes /etc/ssh/sshd_config_hermes
 
 # Node 22 LTS: copy the node binary plus the bundled npm + corepack JS
 # installs from the upstream image.  npm and npx are recreated as symlinks
@@ -279,6 +283,12 @@ RUN mkdir -p /etc/cont-init.d && \
     chmod +x /etc/cont-init.d/01-hermes-setup
 COPY --chmod=0755 docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
 COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
+
+# Expose the `hermes` CLI on a path that's in the default PATH for
+# non-interactive SSH sessions (HERMES_SSHD=1).  Without this, sshd-spawned
+# shells don't source /etc/profile or .bashrc so the venv bin dir isn't
+# on PATH and Hermes Desktop's SSH-proxied `hermes …` calls all 404.
+RUN ln -sf /opt/hermes/.venv/bin/hermes /usr/local/bin/hermes
 
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
