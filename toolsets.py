@@ -317,6 +317,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "whatsapp": {
+        "description": "Native WhatsApp messaging via a whatsapp-web.js bridge: send messages, read recent messages, list contacts",
+        "tools": ["whatsapp_send", "whatsapp_read", "whatsapp_contacts"],
+        "includes": []
+    },
+
 
     # Scenario-specific toolsets
     
