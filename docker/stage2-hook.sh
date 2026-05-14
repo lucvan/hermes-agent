@@ -694,4 +694,24 @@ if [ -z "${AGENT_BROWSER_EXECUTABLE_PATH:-}" ] && \
     fi
 fi
 
+# --- Re-own host-editable trees on every boot ---
+# Same docker-exec/root-write reason as profiles/, cron/ and pairing/ above,
+# plus a host-mount case those blocks don't cover: on Docker Desktop for
+# Windows, files under skills/, tools/ and plugins/ edited directly on the
+# host land as root:root through the 9p/drvfs mount regardless of the volume
+# root's owner. The targeted data-volume chown is gated on needs_chown (which
+# only inspects $HERMES_HOME itself), so a warm volume with a hermes-owned
+# HERMES_HOME but root-owned host-edited skills leaves the unprivileged
+# runtime unable to read them — skills silently vanish from the agent.
+#
+# Gated on tree_has_non_hermes_owner so warm boots skip the recursive walk:
+# skills/ can be large, and enumerating it on every boot costs real startup
+# time on a slow host mount. chown_hermes_tree carries the symlink guard
+# (CWE-59/367) that a bare `chown -R` here would not.
+for _host_tree in skills tools plugins; do
+    if [ -d "$HERMES_HOME/$_host_tree" ] &&        tree_has_non_hermes_owner "$HERMES_HOME/$_host_tree"; then
+        chown_hermes_tree "$HERMES_HOME/$_host_tree"
+    fi
+done
+
 echo "[stage2] Setup complete; starting user services"
