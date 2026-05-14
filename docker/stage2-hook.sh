@@ -588,4 +588,16 @@ if [ -z "${AGENT_BROWSER_EXECUTABLE_PATH:-}" ] && \
     fi
 fi
 
+# --- Re-own host-editable trees on every boot ---
+# Files under skills/, tools/, and plugins/ edited on the Windows host land
+# as root:root via the 9p/drvfs mount regardless of the volume root's owner.
+# The targeted chown above is gated on needs_chown, so it misses these.
+# Unconditionally re-own on every boot so the hermes runtime can always read
+# host-edited skills and tools.
+for d in skills tools plugins; do
+    if [ -d "$HERMES_HOME/$d" ]; then
+        chown -R hermes:hermes "$HERMES_HOME/$d" 2>/dev/null || true
+    fi
+done
+
 echo "[stage2] Setup complete; starting user services"
