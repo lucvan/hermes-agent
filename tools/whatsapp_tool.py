@@ -19,15 +19,21 @@ import logging
 import os
 import signal
 import subprocess
+import tempfile
 
 logger = logging.getLogger(__name__)
 
 # Bridge script + its bundled Chrome live on the mounted /opt/data volume.
+_BRIDGE_DIR = "/opt/data/whatsapp"
 _BRIDGE_SCRIPT = "/opt/data/whatsapp/whatsapp.js"
 _CHROME_PATH = (
     "/opt/data/home/.cache/puppeteer/chrome/"
     "linux-146.0.7680.31/chrome-linux64/chrome"
 )
+# The bridge's whatsapp-web.js auth/session dir — used both by the bridge and
+# to hunt down a leaked Chrome (puppeteer detaches Chrome into its own session,
+# so killing `node` never reaps it).
+_SESSION_DIR_MARKER = "/opt/data/whatsapp/.wwebjs_auth"
 # Cold start = Chrome boot + 5 s server-ack wait; 90 s leaves headroom.
 _BRIDGE_TIMEOUT_SECONDS = 90
 
@@ -35,6 +41,30 @@ _BRIDGE_TIMEOUT_SECONDS = 90
 def _check_whatsapp_available() -> bool:
     """Toolset is only available when the Node.js bridge script is present."""
     return os.path.isfile(_BRIDGE_SCRIPT)
+
+
+def _kill_leaked_chrome() -> None:
+    """SIGKILL any Chrome bound to the bridge's WhatsApp Web session dir.
+
+    puppeteer launches Chrome detached (its own session), so killing the
+    `node` process never reaps it.  A leaked Chrome keeps the WhatsApp Web
+    SingletonLock held and silently blocks every later run, so on timeout it
+    has to be hunted down by its ``--user-data-dir``.
+    """
+    import glob
+
+    marker = _SESSION_DIR_MARKER.encode()
+    for cmdline_path in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            with open(cmdline_path, "rb") as fh:
+                argv = fh.read()
+        except OSError:
+            continue
+        if marker in argv:
+            try:
+                os.kill(int(cmdline_path.split("/")[2]), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
 
 
 def _run_bridge(*args: str) -> str:
@@ -50,45 +80,49 @@ def _run_bridge(*args: str) -> str:
     # interactive shell env where the bridge is normally exercised, so
     # puppeteer's auto-discovery can't be relied on here.
     env = {**os.environ, "PUPPETEER_EXECUTABLE_PATH": _CHROME_PATH}
-    # start_new_session puts `node` in its own process group so a timeout can
-    # kill the whole tree.  node spawns a Chrome process tree via puppeteer;
-    # killing only `node` orphans Chrome, which keeps the WhatsApp Web
-    # SingletonLock held and silently blocks every subsequent run.
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            start_new_session=True,
-        )
-    except FileNotFoundError:
-        return tool_error("WhatsApp bridge unavailable: `node` not found on PATH")
 
+    # Three non-obvious traps, all learned the hard way:
+    #  - Run with cwd=_BRIDGE_DIR.  whatsapp-web.js's webVersionCache defaults
+    #    to ``./.wwebjs_cache`` *relative to cwd*, and the bridge doesn't
+    #    override it — run from anywhere else and client init hangs forever.
+    #  - Redirect to temp files, NOT pipes.  puppeteer's Chrome inherits this
+    #    process's stdout/stderr fds; with PIPE the write end stays open after
+    #    `node` exits (detached Chrome holds a copy) so a pipe read hangs.
+    #  - Do NOT pass start_new_session.  Running `node` as a session leader
+    #    makes the puppeteer/Chrome launch itself hang indefinitely.
+    out_f = tempfile.TemporaryFile(mode="w+")
+    err_f = tempfile.TemporaryFile(mode="w+")
     try:
-        stdout, stderr = proc.communicate(timeout=_BRIDGE_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+            proc = subprocess.Popen(
+                cmd, stdout=out_f, stderr=err_f, env=env, cwd=_BRIDGE_DIR
+            )
+        except FileNotFoundError:
+            return tool_error("WhatsApp bridge unavailable: `node` not found on PATH")
+
+        try:
+            proc.wait(timeout=_BRIDGE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
             proc.kill()
-        try:
-            proc.communicate(timeout=10)
-        except Exception:
-            pass
-        return tool_error(
-            f"WhatsApp bridge timed out after {_BRIDGE_TIMEOUT_SECONDS}s "
-            "(Chrome may have failed to start; process tree killed)"
-        )
+            proc.wait()
+            _kill_leaked_chrome()
+            return tool_error(
+                f"WhatsApp bridge timed out after {_BRIDGE_TIMEOUT_SECONDS}s "
+                "(node + leaked Chrome killed)"
+            )
+
+        out_f.seek(0)
+        err_f.seek(0)
+        stdout = out_f.read().strip()
+        stderr = err_f.read().strip()
+    finally:
+        out_f.close()
+        err_f.close()
 
     if proc.returncode != 0:
-        stderr = (stderr or "").strip()
         return tool_error(
             f"WhatsApp bridge exited {proc.returncode}: {stderr or 'no stderr'}"
         )
-
-    stdout = (stdout or "").strip()
     if not stdout:
         return tool_error("WhatsApp bridge produced no output")
 
