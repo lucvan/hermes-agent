@@ -67,6 +67,15 @@ def register_credential_file(
     The resolved host path must remain inside HERMES_HOME so that a malicious
     skill cannot declare ``required_credential_files: ['../../.ssh/id_rsa']``
     and exfiltrate sensitive host files into a container sandbox.
+
+    Containment alone is not sufficient, because HERMES_HOME is exactly where
+    the MASTER credential stores live. A skill legitimately needs its own
+    service token (``google_token.json``); it never needs ``.env`` (every
+    provider key), ``auth.json`` (all provider tokens and OAuth grants),
+    ``mcp-tokens/`` or the Bitwarden plaintext cache. Those are refused via
+    the canonical read deny-list (``agent.file_safety.get_read_block_error``)
+    — the same guard that stops the agent reading them with ``read_file``, so
+    the mount surface cannot hand a skill what the read surface denies it.
     """
     hermes_home = _resolve_hermes_home()
 
@@ -96,6 +105,29 @@ def register_credential_file(
     resolved = host_path.resolve()
     if not resolved.is_file():
         logger.debug("credential_files: skipping %s (not found)", resolved)
+        return False
+
+    # Master credential stores are never mountable, even though they sit
+    # inside HERMES_HOME and therefore pass the containment check above.
+    # Fails CLOSED: if the canonical guard can't be consulted we refuse the
+    # mount rather than risk bind-mounting auth.json into a sandbox.
+    try:
+        from agent.file_safety import get_read_block_error
+
+        denied = get_read_block_error(str(resolved))
+    except Exception as exc:  # pragma: no cover - core module
+        logger.warning(
+            "credential_files: refusing %r — read guard unavailable (%s)",
+            relative_path, exc,
+        )
+        return False
+    if denied:
+        logger.warning(
+            "credential_files: refused %r — it is a credential store the agent "
+            "is denied from reading; a skill may mount its own service token, "
+            "not the master key files",
+            relative_path,
+        )
         return False
 
     container_path = f"{container_base.rstrip('/')}/{relative_path}"
@@ -349,6 +381,8 @@ _CACHE_DIRS: list[tuple[str, str]] = [
     ("cache/audio", "audio_cache"),
     ("cache/videos", "video_cache"),
     ("cache/screenshots", "browser_screenshots"),
+    ("cache/web", "web_cache"),
+    ("cache/delegation", "delegation_cache"),
 ]
 
 
@@ -398,6 +432,30 @@ def map_cache_path_to_container(
             continue
         return posixpath.join(mount["container_path"], rel.as_posix())
     return None
+
+
+def from_agent_visible_cache_path(
+    container_path: str,
+    container_base: str = "/root/.hermes",
+) -> str:
+    """Translate a sandbox/container cache path back to its host path.
+
+    Inverse of :func:`to_agent_visible_cache_path`. Returns the input unchanged
+    when the active backend is not Docker, or when the path is not under any
+    auto-mounted cache directory — the caller then treats a still-container
+    path as "no host file" and falls back to an in-container read.
+    """
+    if os.environ.get("TERMINAL_ENV", "local") != "docker":
+        return container_path
+
+    path = Path(container_path)
+    for mount in get_cache_directory_mounts(container_base=container_base):
+        try:
+            rel = path.relative_to(mount["container_path"])
+        except ValueError:
+            continue
+        return str(Path(mount["host_path"]) / rel)
+    return container_path
 
 
 def to_agent_visible_cache_path(
