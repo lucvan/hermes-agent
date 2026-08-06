@@ -364,6 +364,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "whatsapp-extras": {
+        "description": "Arbitrary-contact WhatsApp send/read/list on top of the hermes-whatsapp bridge (not just the reactive current chat)",
+        "tools": ["whatsapp_send", "whatsapp_read", "whatsapp_contacts"],
+        "includes": []
+    },
+
 
     # Scenario-specific toolsets
     
