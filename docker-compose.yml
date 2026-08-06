@@ -38,6 +38,18 @@ services:
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
+      # Run the dashboard as upstream's supervised s6 sidecar INSIDE this
+      # container (docker/s6-rc.d/dashboard) instead of as a second
+      # container. A separate dashboard container shares this bind-mounted
+      # /opt/data and re-runs profile-gateway reconciliation on boot, which
+      # auto-starts the `default` profile gateway there too — a second
+      # Telegram poller that fights the real gateway over getUpdates and
+      # causes duplicate/garbled replies. One container = one reconcile =
+      # one gateway = one poller. HERMES_DASHBOARD_HOST defaults to
+      # 0.0.0.0 upstream; pin it to loopback here.
+      - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD_HOST=127.0.0.1
+      - HERMES_DASHBOARD_PORT=9119
       # To expose the OpenAI-compatible API server beyond localhost,
       # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
       # - API_SERVER_HOST=0.0.0.0
@@ -60,9 +72,21 @@ services:
       # - GOOGLE_CHAT_ALLOWED_USERS=${GOOGLE_CHAT_ALLOWED_USERS}
     command: ["gateway", "run"]
 
+  # Standalone dashboard container — DISABLED on this host.
+  #
+  # Gated behind the `standalone-dashboard` compose profile so a plain
+  # `docker compose up -d` does NOT start it. The dashboard runs as
+  # upstream's supervised s6 sidecar inside the `gateway` container instead
+  # (HERMES_DASHBOARD=1 above). Running it as its own container double-runs
+  # profile-gateway reconciliation against the shared /opt/data volume,
+  # spawning a second Telegram poller (getUpdates conflict → duplicate/
+  # garbled replies). To run it standalone again:
+  # `docker compose --profile standalone-dashboard up -d`
+  # (and remove HERMES_DASHBOARD from the gateway service first).
   dashboard:
     image: hermes-agent
     container_name: hermes-dashboard
+    profiles: ["standalone-dashboard"]
     restart: unless-stopped
     network_mode: host
     depends_on:
