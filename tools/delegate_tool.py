@@ -1373,13 +1373,37 @@ def _build_child_agent(
 
         child_thinking_cb = _child_thinking
 
-    # Resolve effective credentials: config override > parent inherit
+    # Resolve effective credentials: config override > parent inherit.
+    #
+    # The runtime bundle (provider, base_url, api_key) MUST be assembled
+    # atomically — all from the override, or all from the parent. Mixing them
+    # (e.g. an override provider with the parent's base_url) produces a
+    # Frankenstein bundle such as copilot credentials pointed at the parent's
+    # Codex endpoint, which 404s on every request and cannot be rescued by
+    # the fallback chain (its dedup matches provider+model, not base_url, so
+    # the chain entry looks like a self-loop and is skipped).
     effective_model = model or parent_agent.model
-    effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or parent_agent.base_url
-    if not override_base_url:
-        effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
-    effective_api_key = override_api_key or parent_api_key
+    _parent_provider = getattr(parent_agent, "provider", None) or ""
+    if override_provider:
+        # Provider override active — the whole endpoint bundle comes from the
+        # override / resolved delegation credentials. base_url never falls
+        # back to the parent's endpoint here: _inherit_parent_base_url exists
+        # to recover the PARENT's live endpoint, which is meaningless for a
+        # DIFFERENT provider. _resolve_delegation_credentials validates that
+        # base_url is present (or that this is an ACP transport) before we
+        # get here.
+        effective_provider = override_provider
+        effective_base_url = override_base_url
+        # api_key may legitimately be None for direct-endpoint providers that
+        # keep their key outside the bundle (see _resolve_delegation_credentials's
+        # delegation.base_url branch); only then inherit the parent's key.
+        effective_api_key = override_api_key or parent_api_key
+    else:
+        # No override — inherit the entire runtime bundle from the parent so
+        # provider/base_url/api_key stay mutually consistent.
+        effective_provider = _parent_provider or None
+        effective_base_url = _inherit_parent_base_url(parent_agent, parent_agent.base_url)
+        effective_api_key = parent_api_key
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
@@ -1391,7 +1415,6 @@ def _build_child_agent(
     # child Hermes/Qwen subagent onto the parent's Claude Messages wire (or the
     # reverse). agent_init honors an explicit api_mode above its nous branch, so
     # re-derive here before construction.
-    _parent_provider = getattr(parent_agent, "provider", None) or ""
     _effective_provider_norm = (effective_provider or "").strip().lower()
     if override_api_mode is not None:
         effective_api_mode = override_api_mode
@@ -3608,6 +3631,18 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         raise ValueError(
             f"Delegation provider '{configured_provider}' resolved but has no API key. "
             f"Set the appropriate environment variable or run 'hermes auth'."
+        )
+
+    # A provider override MUST resolve a concrete endpoint. If base_url comes
+    # back empty (and the provider is not an ACP/external-process transport),
+    # _build_child_agent's atomic bundle assembly has nothing to construct the
+    # child from — fail loudly here instead of building a subagent with a
+    # missing endpoint.
+    if not runtime.get("base_url") and not runtime.get("command"):
+        raise ValueError(
+            f"Delegation provider '{configured_provider}' resolved without a "
+            f"base_url. Refusing to build a subagent with an incomplete credential "
+            f"bundle — check the provider's configuration / auth."
         )
 
     return {
