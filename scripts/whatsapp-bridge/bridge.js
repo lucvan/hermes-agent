@@ -15,6 +15,14 @@
  *   GET  /chat/:id       - Get chat info
  *   GET  /health         - Health check
  *
+ * Local extensions (plugins/platforms/whatsapp/adapter.py resolve_contact/
+ * list_contacts/get_history — not part of upstream, added for arbitrary-
+ * contact lookup/read since upstream's agent tools are reactive-only):
+ *   GET  /contacts       - List known contacts/groups {jid, name, isGroup}
+ *   GET  /history/:id    - Recent buffered messages for a chat (live-forward
+ *                          only — Baileys has no history sync here, so this
+ *                          only covers messages seen since the bridge started)
+ *
  * Usage:
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
@@ -282,6 +290,55 @@ const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
 const messageStore = createBoundedMessageStore(512);
 
+// --- Local extensions: contacts + bounded per-chat history ---
+// Not part of upstream. Upstream's WhatsApp platform is reactive-only (see
+// toolsets.py's "agents do NOT get an agent-callable send_message tool"
+// note) and keeps no message store at all ("We don't maintain a message
+// store" below, in startSocket). Hermes previously ran a separate
+// whatsapp-web.js bridge with whatsapp_send/read/contacts agent tools; this
+// restores that arbitrary-contact send/read/list capability on top of the
+// Baileys bridge instead of keeping two bridges alive.
+
+// jid -> { jid, name, isGroup }. Populated from contacts.upsert/update,
+// groups.upsert/update, and the initial messaging-history.set sync.
+const contactsStore = new Map();
+
+function rememberContact(jid, name, isGroup) {
+  if (!jid || !name) return;
+  const existing = contactsStore.get(jid);
+  if (existing && existing.name === name && existing.isGroup === !!isGroup) return;
+  contactsStore.set(jid, { jid, name, isGroup: !!isGroup });
+}
+
+// chatId -> bounded array of lightweight message records, live-forward only.
+// Baileys does not sync history (syncFullHistory: false below), so this only
+// ever covers messages seen since the bridge process started — unlike
+// whatsapp-web.js's chat.fetchMessages(), which pulls from WhatsApp's own
+// history on demand. Capped per-chat and by total chat count so memory stays
+// flat under long uptime across many chats.
+const HISTORY_PER_CHAT = 200;
+const HISTORY_MAX_CHATS = 500;
+const chatHistory = new Map();
+
+function rememberHistory(chatId, record) {
+  let arr = chatHistory.get(chatId);
+  if (!arr) {
+    if (chatHistory.size >= HISTORY_MAX_CHATS) {
+      const oldest = chatHistory.keys().next().value;
+      chatHistory.delete(oldest);
+    }
+    arr = [];
+    chatHistory.set(chatId, arr);
+  } else {
+    // Re-insert at the end of iteration order so recently-active chats
+    // survive HISTORY_MAX_CHATS eviction ahead of idle ones.
+    chatHistory.delete(chatId);
+    chatHistory.set(chatId, arr);
+  }
+  arr.push(record);
+  if (arr.length > HISTORY_PER_CHAT) arr.shift();
+}
+
 function normalizePollUpdateOptions(aggregation, pollUpdateMessage, meId) {
   const selected = [];
   for (const option of aggregation || []) {
@@ -421,6 +478,44 @@ async function startSocket() {
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
+  // --- Local extension: contacts/groups tracking for GET /contacts ---
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const c of contacts || []) {
+      rememberContact(c.id, c.name || c.notify || c.verifiedName, false);
+    }
+  });
+  sock.ev.on('contacts.update', (updates) => {
+    for (const c of updates || []) {
+      if (c.name || c.notify || c.verifiedName) {
+        rememberContact(c.id, c.name || c.notify || c.verifiedName, false);
+      }
+    }
+  });
+  sock.ev.on('groups.upsert', (groups) => {
+    for (const g of groups || []) {
+      rememberContact(g.id, g.subject, true);
+    }
+  });
+  sock.ev.on('groups.update', (updates) => {
+    for (const g of updates || []) {
+      if (g.subject) rememberContact(g.id, g.subject, true);
+    }
+  });
+  // Fired once after initial connect with whatever baseline sync WhatsApp
+  // sends (contacts/chats and a small amount of recent messages even with
+  // syncFullHistory: false). Best-effort seed for both stores; the live
+  // messages.upsert/contacts.upsert handlers keep them current after this.
+  sock.ev.on('messaging-history.set', ({ chats, contacts }) => {
+    for (const c of contacts || []) {
+      rememberContact(c.id, c.name || c.notify || c.verifiedName, false);
+    }
+    for (const chat of chats || []) {
+      if (chat.id?.endsWith('@g.us') && chat.name) {
+        rememberContact(chat.id, chat.name, true);
+      }
+    }
+  });
+
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -554,6 +649,39 @@ async function startSocket() {
         senderId: redactWhatsAppId(senderId),
         messageKeys: Object.keys(msg.message || {}),
       });
+
+      // --- Local extension: history capture for GET /history/:id ---
+      // Deliberately BEFORE the mode/allowlist gating below: whatsapp_read
+      // needs messages from ANY chat, not just the ones allowed to trigger
+      // the reactive agent pipeline. Independent extractBridgeEvent() call so
+      // a parsing failure here can never affect the reactive path — and
+      // downloadMedia is omitted so this never fetches media bytes, only
+      // metadata (hasMedia/mediaType).
+      if (!chatId.includes('status')) {
+        try {
+          const historyEvent = await extractBridgeEvent({
+            msg,
+            chatId,
+            senderId,
+            senderNumber,
+            isGroup,
+          });
+          if (historyEvent.body || historyEvent.hasMedia) {
+            rememberHistory(chatId, {
+              id: msg.key.id,
+              from: msg.key.fromMe ? 'me' : senderId,
+              author: isGroup ? senderId : undefined,
+              body: historyEvent.body,
+              type: historyEvent.mediaType || 'text',
+              hasMedia: !!historyEvent.hasMedia,
+              time: new Date((Number(msg.messageTimestamp) || Date.now() / 1000) * 1000).toISOString(),
+              mentionedIds: historyEvent.mentionedIds,
+            });
+          }
+        } catch (err) {
+          console.warn('[bridge] history capture failed:', err.message);
+        }
+      }
 
       // Handle fromMe messages based on mode
       let fromOwner = false;
@@ -1101,6 +1229,29 @@ app.get('/chat/:id', async (req, res) => {
     isGroup,
     participants: [],
   });
+});
+
+// --- Local extension: contacts + history (see header doc comment) ---
+
+// List known contacts/groups, most-recently-updated first. Populated from
+// contacts.upsert/update, groups.upsert/update, and messaging-history.set —
+// only covers identities WhatsApp has told this session about (contacts
+// synced to the linked account, plus anyone who has messaged it), not a
+// full address-book export.
+app.get('/contacts', (req, res) => {
+  const list = Array.from(contactsStore.values()).reverse();
+  res.json({ contacts: list, count: list.length });
+});
+
+// Bounded live-forward message history for one chat (see HISTORY_PER_CHAT /
+// rememberHistory above) — NOT a fetch from WhatsApp's own history, only
+// messages this bridge process has seen since it started.
+app.get('/history/:id', (req, res) => {
+  const chatId = req.params.id;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 10, HISTORY_PER_CHAT));
+  const arr = chatHistory.get(chatId) || [];
+  const messages = arr.slice(-limit);
+  res.json({ chatId, count: messages.length, messages });
 });
 
 // Health check

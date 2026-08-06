@@ -1785,6 +1785,97 @@ async def _standalone_send(
         return {"error": f"WhatsApp send failed: {e}"}
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Local extensions: arbitrary-contact list/read/resolve
+#
+# Not part of upstream. Upstream's WhatsApp platform is reactive-only — the
+# gateway only sees messages as they arrive in whichever chat is messaging
+# it, and there is no agent-callable send_message tool on any platform (see
+# toolsets.py). Hermes previously ran a separate whatsapp-web.js bridge with
+# whatsapp_send/read/contacts agent tools for arbitrary-contact lookups; this
+# restores that on top of the Baileys bridge's /contacts and /history/:id
+# endpoints (scripts/whatsapp-bridge/bridge.js) instead of keeping a second
+# bridge process alive. Standalone module-level functions, same pattern as
+# _standalone_send above, so they work whether or not the gateway is running
+# in this process.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+async def list_contacts(pconfig) -> Dict[str, Any]:
+    """List known WhatsApp contacts/groups from the bridge's live session.
+
+    Only identities the bridge has been told about this session (synced
+    contacts, groups, plus anyone who has messaged it) — not a full
+    address-book export.
+    """
+    extra = getattr(pconfig, "extra", {}) or {}
+    bridge_port = extra.get("bridge_port", 3000)
+    try:
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://127.0.0.1:{bridge_port}/contacts",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return {"error": f"WhatsApp bridge error ({resp.status}): {body}"}
+                return await resp.json()
+    except Exception as e:
+        return {"error": f"WhatsApp contacts lookup failed: {e}"}
+
+
+async def get_history(pconfig, chat_id: str, limit: int = 10) -> Dict[str, Any]:
+    """Recent buffered messages for one chat.
+
+    Live-forward only: the bridge keeps no persistent message store (Baileys
+    runs with syncFullHistory: false), so this only covers messages seen
+    since the bridge process started, not WhatsApp's own history. For deep
+    on-demand history queries, there is no equivalent here — that gap is a
+    known, deliberate limitation of moving off the old whatsapp-web.js bridge.
+    """
+    extra = getattr(pconfig, "extra", {}) or {}
+    bridge_port = extra.get("bridge_port", 3000)
+    normalized_chat_id = to_whatsapp_jid(chat_id)
+    try:
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://127.0.0.1:{bridge_port}/history/{normalized_chat_id}",
+                params={"limit": str(limit)},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return {"error": f"WhatsApp bridge error ({resp.status}): {body}"}
+                return await resp.json()
+    except Exception as e:
+        return {"error": f"WhatsApp history lookup failed: {e}"}
+
+
+async def resolve_contact(pconfig, name_or_number: str) -> Optional[str]:
+    """Resolve a display name or phone number to a WhatsApp JID.
+
+    Case-insensitive substring match against known contacts/groups first
+    (mirrors the old whatsapp-web.js bridge's lookup UX); falls back to
+    treating the input as a raw phone number via to_whatsapp_jid. Returns
+    None only when the input has no digits and matches no known contact.
+    """
+    needle = (name_or_number or "").strip().lower()
+    if not needle:
+        return None
+    contacts = await list_contacts(pconfig)
+    for entry in contacts.get("contacts", []) if isinstance(contacts, dict) else []:
+        name = str(entry.get("name") or "").lower()
+        if name and needle in name:
+            return entry.get("jid")
+    if re.search(r"\d", name_or_number):
+        return to_whatsapp_jid(name_or_number)
+    return None
+
+
 def interactive_setup() -> None:
     """Guide the user through WhatsApp setup.
 
