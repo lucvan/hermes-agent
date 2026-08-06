@@ -164,11 +164,30 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
   );
 }
 
-function formatOutgoingMessage(message) {
+// Local extension: is `chatId` the linked account's own self-chat?
+// Mirrors the inbound self-chat identity check in the messages.upsert
+// handler (myNumber/myLid comparison) — kept as a standalone helper so
+// formatOutgoingMessage (below) can reuse it without sock.user being
+// threaded through call sites that don't otherwise need it.
+function isSelfChatId(chatId) {
+  const myNumber = (sock?.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+  const myLid = (sock?.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
+  const chatNumber = String(chatId || '').replace(/@.*/, '');
+  return (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
+}
+
+function formatOutgoingMessage(message, chatId) {
   // In bot mode, messages come from a different number so the prefix is
   // redundant — the sender identity is already clear.  Only prepend in
   // self-chat mode where bot and user share the same number.
   if (WHATSAPP_MODE !== 'self-chat') return message;
+  // Local extension: even in self-chat mode, only prefix messages actually
+  // going to the self-chat thread. The prefix exists to distinguish the
+  // agent's replies from the user's own typed messages within that ONE
+  // shared thread — an arbitrary third-party contact (whatsapp_send to
+  // someone else) has no such ambiguity, and prefixing there would
+  // needlessly out the message as bot-generated to that person.
+  if (!isSelfChatId(chatId)) return message;
   return REPLY_PREFIX ? `${REPLY_PREFIX}${message}` : message;
 }
 
@@ -959,7 +978,7 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    const chunks = splitLongMessage(formatOutgoingMessage(message, chatId));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
       const { content: payload, options } = buildTextSendPayload(chunks[i], {
@@ -999,7 +1018,7 @@ app.post('/edit', async (req, res) => {
 
   try {
     const key = { id: messageId, fromMe: true, remoteJid: chatId };
-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    const chunks = splitLongMessage(formatOutgoingMessage(message, chatId));
     const messageIds = [];
 
     await sendWithTimeout(chatId, { text: chunks[0], edit: key });
