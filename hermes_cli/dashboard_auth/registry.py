@@ -54,6 +54,23 @@ def register_provider(
     )
 
 
+def _gate(provider: DashboardAuthProvider) -> DashboardAuthProvider:
+    """Apply the dashboard email allowlist, if one is configured.
+
+    Gating happens on the way *out* of the registry rather than at
+    registration so the stored object remains the exact instance the
+    caller registered — ``unregister_global_provider`` and
+    ``restore_registration`` compare with ``is``, and handing them a proxy
+    would silently break provider teardown and rotation.
+
+    Called outside ``_lock``: resolving the allowlist can read config.yaml,
+    which must not happen while holding the registry lock.
+    """
+    from hermes_cli.dashboard_auth.email_allowlist import wrap
+
+    return wrap(provider)
+
+
 def get_provider(
     name: str,
     *,
@@ -61,7 +78,8 @@ def get_provider(
 ) -> Optional[DashboardAuthProvider]:
     """Return the registered provider for ``name``, or None if unknown."""
     with _lock:
-        return _merged(scope).get(name)
+        provider = _merged(scope).get(name)
+    return _gate(provider) if provider is not None else None
 
 
 def snapshot_registration(
@@ -96,9 +114,15 @@ def restore_registration(
 
 
 def list_providers(*, scope: Optional[str] = None) -> List[DashboardAuthProvider]:
-    """All registered providers, in registration order."""
+    """All registered providers, in registration order.
+
+    Entries are allowlist-gated (see ``_gate``); ``list_session_providers``
+    and ``list_token_providers`` derive from this, so every consumer-facing
+    lookup is covered by the one hook.
+    """
     with _lock:
-        return list(_merged(scope).values())
+        providers = list(_merged(scope).values())
+    return [_gate(p) for p in providers]
 
 
 def list_token_providers() -> List[DashboardAuthProvider]:
