@@ -295,6 +295,36 @@ def _mint_document_id(session_id: str) -> str:
     return f"{session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
 
 
+_MAX_RECALL_SOURCES = 3
+
+
+def _recall_source_label(fact: Any) -> str:
+    """Where one recalled fact came from: the path a document sync stamped into its
+    metadata (e.g. an Obsidian note), a dated conversation for this plugin's own turn
+    and tool retains (their metadata carries turn_index), else the document id."""
+    metadata = getattr(fact, "metadata", None) or {}
+    if metadata.get("path"):
+        return metadata["path"]
+    if "turn_index" in metadata:
+        when = (getattr(fact, "occurred_start", None) or getattr(fact, "mentioned_at", None) or "")[:10]
+        return f"conversation {when}".rstrip()
+    return getattr(fact, "document_id", None) or ""
+
+
+def _recall_sources_suffix(result: Any, source_facts: Dict[str, Any]) -> str:
+    """`` (source: …)`` for one recall result. Observations cite the distinct sources of
+    the facts they consolidate (capped at _MAX_RECALL_SOURCES); raw facts cite their own."""
+    fact_ids = getattr(result, "source_fact_ids", None)
+    facts = [source_facts[i] for i in fact_ids if i in source_facts] if fact_ids else [result]
+    labels = list(dict.fromkeys(label for fact in facts if (label := _recall_source_label(fact))))
+    if not labels:
+        return ""
+    shown = "; ".join(labels[:_MAX_RECALL_SOURCES])
+    if len(labels) > _MAX_RECALL_SOURCES:
+        shown += f"; +{len(labels) - _MAX_RECALL_SOURCES} more"
+    return f" (source{'s' if len(labels) > 1 else ''}: {shown})"
+
+
 # initialize() kwargs copied verbatim (str, stripped) onto ``self._<name>``.
 _SESSION_KWARGS = (
     "platform", "user_id", "user_name", "chat_id", "chat_name", "chat_type",
@@ -441,6 +471,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
+            {"key": "recall_include_sources", "description": "Append each recalled memory's source (document path from metadata.path, 'conversation <date>' for Hermes turns, else document id) to auto-recall and hindsight_recall output; observations cite the sources of their supporting facts", "default": False},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
@@ -796,6 +827,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
         else:
             self._recall_types = list([] if configured_types is None else configured_types) or ["observation"]
+        self._recall_include_sources = bool(cfg.get("recall_include_sources", False))
         self._recall_prompt_preamble = cfg.get("recall_prompt_preamble", "")
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
 
@@ -875,14 +907,20 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Prefetch: skipped (%s)", why)
         return why is not None
 
-    def _recall(self, query: str) -> list:
+    def _recall(self, query: str) -> list[str]:
+        """Recall *query* -> one formatted line per result with text (sources appended
+        when recall_include_sources is on)."""
         kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
         if self._recall_tags:
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types
+        if self._recall_include_sources:
+            kwargs["include_source_facts"] = True
         resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
-        return resp.results or []
+        source_facts = getattr(resp, "source_facts", None) or {}
+        return [r.text + (_recall_sources_suffix(r, source_facts) if self._recall_include_sources else "")
+                for r in resp.results or [] if r.text]
 
     def _reflect(self, query: str) -> str | None:
         resp = self._run_hindsight_operation(
@@ -901,9 +939,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 return self._reflect(query) or "", 0
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
-            results = self._recall(query)
-            logger.debug("Recall: returned %d results", len(results))
-            return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
+            lines = self._recall(query)
+            logger.debug("Recall: returned %d results", len(lines))
+            return "\n".join(f"- {line}" for line in lines), len(lines)
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
             return "", 0
@@ -1102,9 +1140,9 @@ class HindsightMemoryProvider(MemoryProvider):
         query = args["query"]
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                      self._bank_id, len(query), self._budget)
-        results = self._recall(query)
-        logger.debug("Tool hindsight_recall: %d results", len(results))
-        return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        lines = self._recall(query)
+        logger.debug("Tool hindsight_recall: %d results", len(lines))
+        return "\n".join(f"{i}. {line}" for i, line in enumerate(lines, 1)) or "No relevant memories found."
 
     def _tool_reflect(self, args: dict) -> str:
         query = args["query"]
