@@ -810,6 +810,67 @@ class TestPrefetchServerRetainVisibility:
 # ---------------------------------------------------------------------------
 
 
+class TestRecallSources:
+    @staticmethod
+    def _response():
+        note = SimpleNamespace(
+            id="f1", text="Alpha launches in March", type="world",
+            document_id="projects/alpha.md", metadata={"path": "projects/alpha.md", "vault": "Notes"},
+        )
+        observation = SimpleNamespace(
+            id="o1", text="The user leads Alpha", type="observation", document_id=None, metadata=None,
+            source_fact_ids=["s1", "s2", "s3", "missing"],
+        )
+        source_facts = {
+            "s1": SimpleNamespace(metadata={"path": "people/team.md"}, document_id="people/team.md"),
+            "s2": SimpleNamespace(metadata={"path": "people/team.md"}, document_id="people/team.md"),
+            "s3": SimpleNamespace(metadata={"turn_index": "4", "session_id": "abc"}, document_id="abc-20260914",
+                                  occurred_start="2026-09-14T10:00:00+00:00", mentioned_at=None),
+        }
+        bare = SimpleNamespace(id="f2", text="Imported fact", type="world", document_id="crm-export-7", metadata={})
+        return SimpleNamespace(results=[note, observation, bare], source_facts=source_facts)
+
+    def test_off_by_default_keeps_text_only_output(self, provider):
+        provider._client.arecall = AsyncMock(return_value=self._response())
+        result = json.loads(provider.handle_tool_call("hindsight_recall", {"query": "alpha"}))
+        assert result["result"] == "1. Alpha launches in March\n2. The user leads Alpha\n3. Imported fact"
+        assert "include_source_facts" not in provider._client.arecall.call_args.kwargs
+
+    def test_tool_recall_cites_sources(self, provider_with_config):
+        p = provider_with_config(recall_include_sources=True)
+        p._client.arecall = AsyncMock(return_value=self._response())
+        result = json.loads(p.handle_tool_call("hindsight_recall", {"query": "alpha"}))
+        assert result["result"] == (
+            "1. Alpha launches in March (source: projects/alpha.md)\n"
+            "2. The user leads Alpha (sources: people/team.md; conversation 2026-09-14)\n"
+            "3. Imported fact (source: crm-export-7)"
+        )
+        assert p._client.arecall.call_args.kwargs["include_source_facts"] is True
+
+    def test_auto_recall_cites_sources(self, provider_with_config):
+        p = provider_with_config(recall_include_sources=True, recall_sync=True)
+        p._client.arecall = AsyncMock(return_value=self._response())
+        block = p.prefetch("alpha")
+        assert "- Alpha launches in March (source: projects/alpha.md)\n" in block
+        assert "- The user leads Alpha (sources: people/team.md; conversation 2026-09-14)\n" in block
+        assert p.recall_status().count == 3
+
+    def test_observation_sources_are_capped(self, provider_with_config):
+        p = provider_with_config(recall_include_sources=True)
+        paths = [f"notes/{n}.md" for n in "abcde"]
+        p._client.arecall = AsyncMock(return_value=SimpleNamespace(
+            results=[SimpleNamespace(id="o1", text="Summary", type="observation", source_fact_ids=paths)],
+            source_facts={path: SimpleNamespace(metadata={"path": path}) for path in paths},
+        ))
+        result = json.loads(p.handle_tool_call("hindsight_recall", {"query": "q"}))
+        assert result["result"] == "1. Summary (sources: notes/a.md; notes/b.md; notes/c.md; +2 more)"
+
+    def test_result_without_any_source_is_left_bare(self, provider_with_config):
+        p = provider_with_config(recall_include_sources=True)
+        result = json.loads(p.handle_tool_call("hindsight_recall", {"query": "q"}))
+        assert result["result"] == "1. Memory 1\n2. Memory 2"
+
+
 class TestRecallStatus:
     def test_none_before_any_prefetch(self, provider):
         # Nothing recalled yet → no indicator.

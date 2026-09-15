@@ -76,6 +76,7 @@ Config file: `~/.hermes/hindsight/config.json`
 | `recall_tags` | — | Tags to filter when searching memories |
 | `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
 | `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. **Default narrowed to `observation` only** (see "Behavior change" below). Set to `observation,world,experience` to also include raw facts. |
+| `recall_include_sources` | `false` | Append where each recalled memory came from, in both auto-recall and the `hindsight_recall` tool: `(source: notes/projects/alpha.md)`. The label is `metadata.path` when a document sync set one, `conversation <date>` for memories Hermes retained from turns, else the `document_id`. Observations cite the distinct sources of their supporting facts (up to 3, then `+N more`), fetched with `include_source_facts`. Useful when a synced document store is the source of truth and the agent must edit the original rather than the memory. |
 | `auto_recall` | `true` | Automatically recall memories before each turn |
 | `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
