@@ -2017,12 +2017,29 @@ class TestAtomicChildCredentialBundle(unittest.TestCase):
         self.assertEqual(kwargs["base_url"], "https://fallback.example/v1")
         self.assertEqual(kwargs["api_key"], "FAKE-KEY-FALLBACK")
 
+    def test_provider_override_uses_its_own_endpoint(self):
+        parent = _make_mock_parent(depth=0)
+        kwargs = self._build(
+            parent, override_provider="minimax", override_base_url="https://api.minimax.example/v1",
+            override_api_key="sk-mm-x")
+        self.assertEqual(kwargs["provider"], "minimax")
+        self.assertEqual(kwargs["base_url"], "https://api.minimax.example/v1")
+        self.assertEqual(kwargs["api_key"], "sk-mm-x")
+
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_without_base_url_is_refused(self, mock_resolve):
         mock_resolve.return_value = {"provider": "copilot", "base_url": "", "api_key": "gh-x", "api_mode": None}
         parent = _make_mock_parent(depth=0)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as ctx:
             _resolve_delegation_credentials({"provider": "copilot", "model": "gpt-5"}, parent)
+        self.assertIn("without a base_url", str(ctx.exception))
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_native_sdk_provider_without_base_url_is_allowed(self, mock_resolve):
+        mock_resolve.return_value = {"provider": "bedrock", "base_url": "", "api_key": "aws", "api_mode": None}
+        parent = _make_mock_parent(depth=0)
+        creds = _resolve_delegation_credentials({"provider": "bedrock", "model": "claude"}, parent)
+        self.assertEqual(creds["provider"], "bedrock")
 
 
 if __name__ == "__main__":
